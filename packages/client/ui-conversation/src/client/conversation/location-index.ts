@@ -136,6 +136,14 @@ interface TurnDraft {
 
 const SESSION_LOCATION = { kind: 'session' } as const
 const UNRESOLVED_LOCATION = { kind: 'unresolved' } as const
+const EMPTY_STEPS: readonly StepLocation[] = []
+
+/**
+ * A published Turn whose `steps` slot keeps advancing in place. Later Step
+ * boundaries swap only the array, so every Location already handed out stays
+ * current for readers of `turn.steps` without a new Turn reference.
+ */
+type LiveTurnLocation = { -readonly [Key in keyof TurnLocation]: TurnLocation[Key] }
 
 function payloadCoordinates(event: SessionEventLike): Coordinates {
   const data = event.data as unknown as { turn?: unknown; step?: unknown }
@@ -190,6 +198,7 @@ export class ConversationLocationIndex {
   private readonly stepDataStores = new Map<string, MutableLocationDataStore>()
   private readonly dirtyDataStores = new Set<MutableLocationDataStore>()
   private readonly changedTurns = new Set<number>()
+  private readonly restructuredTurns = new Set<number>()
   private currentTurn: number | undefined
   private currentStep: number | undefined
 
@@ -209,6 +218,31 @@ export class ConversationLocationIndex {
     const turns = [...this.changedTurns]
     this.changedTurns.clear()
     return turns
+  }
+
+  /**
+   * Drain Turns whose published Step list advanced in place during the preceding appends.
+   * Readers of `location.turn.steps` see the new list through the retained Turn, so their
+   * Contexts need rebuilds rather than the full replay owed to a replaced Turn.
+   * @returns Turn numbers whose Step membership changed without replacing the Turn.
+   */
+  takeRestructuredTurns(): readonly number[] {
+    const turns = [...this.restructuredTurns]
+    this.restructuredTurns.clear()
+    return turns
+  }
+
+  /**
+   * Read the sequence numbers anchored at one Turn instead of one of its Steps.
+   * @param turn - Turn number.
+   * @returns Session sequence numbers whose Location names only the Turn.
+   */
+  turnScopedSeqs(turn: number): number[] {
+    const seqs: number[] = []
+    for (const seq of this.seqsByTurn.get(turn) ?? []) {
+      if (this.coordinates.get(seq)?.step === undefined) seqs.push(seq)
+    }
+    return seqs
   }
 
   /**
@@ -437,9 +471,12 @@ export class ConversationLocationIndex {
   }
 
   /**
-   * Append one Turn/Step boundary while revisiting only the owning Turn.
+   * Append one Turn/Step boundary. A Turn boundary revisits every seq of the
+   * owning Turn; a Step boundary revisits only the seqs of the Step it owns,
+   * because it replaces at most that Step's `StepLocation` and keeps the Turn
+   * reference current by swapping its live `steps` slot.
    * @param event - contiguous tail boundary event.
-   * @returns seqs whose immutable Location reference changed.
+   * @returns seqs whose resolved Location reference changed.
    */
   appendBoundary(event: SessionEvent): ReadonlySet<number> {
     if (event.type !== 'turn/start' && event.type !== 'turn/end'
@@ -473,7 +510,7 @@ export class ConversationLocationIndex {
     this.indexTurnSeq(turnNumber, event.seq)
 
     const previousTurn = this.timeline.turns.get(turnNumber)
-    let steps = previousTurn?.steps ?? []
+    let steps = previousTurn?.steps ?? EMPTY_STEPS
     if (event.type === 'step/start' || event.type === 'step/end') {
       const number = event.data.step
       const indexedSteps = this.stepsByTurn.get(turnNumber) ?? new Map<number, StepLocation>()
@@ -492,30 +529,47 @@ export class ConversationLocationIndex {
       const index = steps.findIndex(step => step.step === number)
       steps = index < 0
         ? [...steps, nextStep]
-        : steps.map((step, at) => at === index ? nextStep : step)
+        : nextStep === steps[index] ? steps : steps.map((step, at) => at === index ? nextStep : step)
     }
-    const candidate: TurnLocation = {
-      turn: turnNumber,
-      start: event.type === 'turn/start' ? event : previousTurn?.start,
-      end: event.type === 'turn/end' ? event : previousTurn?.end,
-      status: event.type === 'turn/end' || previousTurn?.end !== undefined
-        ? 'closed'
-        : event.type === 'turn/start' || previousTurn?.start !== undefined ? 'open' : 'unknown',
-      steps,
-      data: this.turnData(turnNumber),
+    const start = event.type === 'turn/start' ? event : previousTurn?.start
+    const end = event.type === 'turn/end' ? event : previousTurn?.end
+    const status: TurnLocation['status'] = end !== undefined
+      ? 'closed'
+      : start !== undefined ? 'open' : 'unknown'
+    const data = this.turnData(turnNumber)
+    const turnReplaced = previousTurn === undefined
+      || previousTurn.start !== start || previousTurn.end !== end
+      || previousTurn.status !== status || previousTurn.data !== data
+    const turn = turnReplaced
+      ? { turn: turnNumber, start, end, status, steps, data } as TurnLocation
+      : previousTurn as TurnLocation
+    const stepsAdvanced = previousTurn !== undefined && previousTurn.steps !== steps
+    if (stepsAdvanced) (turn as LiveTurnLocation).steps = steps
+    if (turnReplaced) {
+      const turns = new Map(this.timeline.turns)
+      turns.set(turnNumber, turn)
+      const turnOrder = previousTurn === undefined
+        ? [...this.timeline.turnOrder, turnNumber]
+        : this.timeline.turnOrder
+      this.timeline = { turnOrder, turns }
+      this.changedTurns.add(turnNumber)
+    } else if (stepsAdvanced) {
+      // The Turn keeps its identity, so only the timeline snapshot reference advances.
+      this.timeline = { turnOrder: this.timeline.turnOrder, turns: this.timeline.turns }
     }
-    const turn = sameTurn(previousTurn, candidate) ? previousTurn as TurnLocation : candidate
-    const turns = new Map(this.timeline.turns)
-    turns.set(turnNumber, turn)
-    const turnOrder = previousTurn === undefined
-      ? [...this.timeline.turnOrder, turnNumber]
-      : this.timeline.turnOrder
-    this.timeline = { turnOrder, turns }
-    if (turn !== previousTurn) this.changedTurns.add(turnNumber)
+    if (stepsAdvanced) {
+      this.changedTurns.add(turnNumber)
+      this.restructuredTurns.add(turnNumber)
+    }
 
     const changed = new Set<number>()
+    const ownedStep = event.type === 'step/start' || event.type === 'step/end' ? event.data.step : undefined
     for (const seq of this.seqsByTurn.get(turnNumber) ?? []) {
       const coordinates = this.coordinates.get(seq) as Coordinates
+      // A Step boundary replaces only its own Step's StepLocation, so seqs of other
+      // Steps keep theirs. The Turn keeps its identity unless start, end, or status
+      // changed, and its live steps slot already advanced in place above.
+      if (ownedStep !== undefined && coordinates.step !== ownedStep) continue
       const previous = coordinates.location
       const next = this.resolve(seq)
       coordinates.location = next

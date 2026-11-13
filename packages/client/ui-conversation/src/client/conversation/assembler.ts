@@ -290,6 +290,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
         publication = 'immediate'
       }
       this.replayContexts(this.refreshMatchLocations(changed))
+      this.restructureTurns()
       if (changed.size > 0) publication = 'immediate'
     } else {
       this.locationIndex.appendNonBoundary(event)
@@ -945,6 +946,19 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
       }
     }
     return replayed
+  }
+
+  /**
+   * Rebuild Contexts anchored at a Turn whose Step list advanced in place.
+   * Their Locations already report the new Steps, so no replay is needed; marking them dirty
+   * re-runs their Definitions' node builders against the retained Turn.
+   */
+  private restructureTurns(): void {
+    for (const turn of this.locationIndex.takeRestructuredTurns()) {
+      for (const seq of this.locationIndex.turnScopedSeqs(turn)) {
+        for (const context of this.contextsBySeq.get(seq) ?? []) this.markDirty(context)
+      }
+    }
   }
 
   private refreshMatchLocations(changedSeqs: ReadonlySet<number>): Set<InternalContext> {
