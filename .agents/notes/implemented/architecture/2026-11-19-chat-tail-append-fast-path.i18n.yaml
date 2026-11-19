@@ -1,0 +1,19 @@
+# Bilingual-pair consistency record for 2026-11-19-chat-tail-append-fast-path.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-11-19-chat-tail-append-fast-path.md
+/agent-note-chat-snapshot-tail-append-fast-path:
+  en: c3cfaca7e36cbbb9
+  zh: 616e4661a799aaf1
+/agent-note-chat-snapshot-tail-append-fast-path/problem:
+  en: 5cdf80be753db5a1
+  zh: f648fb8a68d46d08
+/agent-note-chat-snapshot-tail-append-fast-path/decision:
+  en: d857480a9b9c6390
+  zh: 93fdadc598468ec8
+/agent-note-chat-snapshot-tail-append-fast-path/alternatives-considered:
+  en: 9b23af5fecbb97c5
+  zh: 4496b97522998fa8
+/agent-note-chat-snapshot-tail-append-fast-path/consequences:
+  en: a8309bf19fe23f70
+  zh: 144cd1c3d7a05606
