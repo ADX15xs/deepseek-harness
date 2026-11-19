@@ -1,0 +1,19 @@
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write tools/desktop-asar-patch/README.md
+/desktop-asar-patch-tool:
+  en: 2ee5f9602dc5807a
+  zh: 57afbbe5acd1046f
+/desktop-asar-patch-tool/files:
+  en: 25e383eaadb0f9e4
+  zh: c1a4b15e755bba6b
+/desktop-asar-patch-tool/patching-a-machine:
+  en: 866ff7e1e3f39b40
+  zh: 5795e1d05b565c77
+/desktop-asar-patch-tool/rebuilding-for-a-new-release:
+  en: 667df5c0a9915752
+  zh: 9b4dbd8163be7f2d
+/desktop-asar-patch-tool/why-the-css-hash-remap-exists:
+  en: 74e02f1e5fbf1c08
+  zh: a95fc451dc36c4cc
