@@ -82,6 +82,12 @@ export type ConversationGroupInput<Node> = GroupInputNodes<Node> & (
     readonly changedTurns: readonly number[]
     /** Turns whose visible keys or immediate neighbours changed, including removal and cross-Turn moves. */
     readonly changedTurnOrders: readonly number[]
+    /**
+     * Keys this batch added after every existing target-order key, or undefined
+     * when the batch may have inserted, moved, or hidden keys. Definitions may
+     * extend tail state from them without rescanning the order.
+     */
+    readonly appendedKeys?: readonly NodeKey[]
   }
 )
 

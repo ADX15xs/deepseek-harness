@@ -13,6 +13,8 @@ import { processActivity } from './process-activity.ts'
 
 type ProcessInput = ConversationGroupInput<ChatConversationViewNode>
 
+const EMPTY_KEYS: readonly NodeKey[] = []
+
 function turnOf(node: ChatNode): number | undefined {
   const location = node.location
   return location.kind === 'turn' || location.kind === 'step' ? location.turn.turn : undefined
@@ -84,6 +86,8 @@ class TurnGroups {
   private groups = new Map<GroupKey, ProcessGroup>()
   private membership = new Map<NodeKey, GroupKey>()
   private roots = new Map<NodeKey, readonly RenderEntry[]>()
+  private pendingTail: NodeReference[] = []
+  private tailKey: NodeKey | undefined
 
   constructor(readonly turn: number) {}
 
@@ -121,14 +125,61 @@ class TurnGroups {
     const roots = new Map<NodeKey, readonly RenderEntry[]>()
     const groups = new Map<GroupKey, ProcessGroup>()
     const membership = new Map<NodeKey, GroupKey>()
-    let pending: NodeReference[] = []
+    const upserts = this.walk(input, added, roots, groups, membership, input.readTurn(this.turn))
+    const removes = [...this.groups.keys()].filter(key => !groups.has(key))
+    this.groups = groups
+    this.membership = membership
+    this.roots = roots
+    return { upserts, removes }
+  }
+
+  /**
+   * Extend the Turn's grouping from keys appended after the last grouped key.
+   * @param input - projected Node changes with position readers.
+   * @param keys - keys appended after the Turn's previously grouped keys.
+   * @param added - keys that became visible in this batch.
+   * @returns group upserts produced by the appended keys, or undefined when the
+   * previous grouping cannot continue; the caller then rebuilds the Turn.
+   */
+  appendKeys(
+    input: ProcessInput, keys: readonly NodeKey[], appended: readonly NodeKey[],
+    added: ReadonlySet<NodeKey>,
+  ): GroupSnapshot<ProcessGroupData>[] | undefined {
+    if (appended.length === 0) return undefined
+    const start = keys.length - appended.length
+    if (this.tailKey !== undefined) {
+      const position = readPosition(input, this.tailKey)
+      if (position.next !== keys[start]) return undefined
+      // A first-grouped Turn without a tail key still owns the earlier keys.
+    } else if (start > 0) return undefined
+    return this.walk(input, added, this.roots, this.groups, this.membership, keys, start)
+  }
+
+  /**
+   * Segment one contiguous key run into groups, writing roots, membership, and
+   * group identity in place. A run ending with an unclosed member run keeps it
+   * as the Turn's pending tail so a later append extends the same group.
+   */
+  private walk(
+    input: ProcessInput, added: ReadonlySet<NodeKey>,
+    roots: Map<NodeKey, readonly RenderEntry[]>, groups: Map<GroupKey, ProcessGroup>,
+    membership: Map<NodeKey, GroupKey>, keys: readonly NodeKey[], start = 0,
+  ): GroupSnapshot<ProcessGroupData>[] {
+    let pending: NodeReference[] = start > 0 ? [...this.pendingTail] : []
     const upserts: GroupSnapshot<ProcessGroupData>[] = []
+    // Re-emitting an extended tail group replaces that group's entry; an
+    // assistant-step head keeps its group entry beside its own response row.
     const emit = (key: NodeKey, entry: RenderEntry): void => {
-      roots.set(key, [...roots.get(key) ?? [], entry])
+      const installed = roots.get(key) ?? []
+      const part = 'groupPart' in entry ? entry.groupPart ?? null : null
+      const next = installed.filter(item =>
+        item.kind !== entry.kind || item.key !== entry.key
+        || ('groupPart' in item ? item.groupPart ?? null : null) !== part)
+      roots.set(key, [...next, entry])
     }
-    const flush = (closed: boolean): void => {
+    const flush = (closed: boolean): readonly NodeReference[] | undefined => {
       const first = pending[0]
-      if (first === undefined) return
+      if (first === undefined) return undefined
       const retained = this.extendedGroup(pending, added)
       const key = retained?.key ?? brandString<GroupKey>(JSON.stringify(['process', first.key, first.groupPart ?? null]))
       const previous = this.groups.get(key)
@@ -140,11 +191,14 @@ class TurnGroups {
       emit(first.key, { kind: 'group', key: group.key })
       for (const member of pending) membership.set(member.key, group.key)
       if (group.snapshot !== before) upserts.push(group.snapshot)
+      const flushed = pending
       pending = []
+      return flushed
     }
     let previous: NodeKey | undefined
     let followed = false
-    for (const key of input.readTurn(this.turn)) {
+    for (let index = start; index < keys.length; index++) {
+      const key = keys[index] as NodeKey
       const position = readPosition(input, key)
       if (previous !== undefined && position.previous !== previous) flush(true)
       previous = key
@@ -162,12 +216,11 @@ class TurnGroups {
         }
       } else pending.push({ kind: 'node', key })
     }
-    flush(followed)
-    const removes = [...this.groups.keys()].filter(key => !groups.has(key))
-    this.groups = groups
-    this.membership = membership
-    this.roots = roots
-    return { upserts, removes }
+    const final = flush(followed)
+    // An unclosed final run stays reachable so a later append extends its group.
+    this.pendingTail = followed || final === undefined ? [] : [...final]
+    this.tailKey = keys[keys.length - 1]
+    return upserts
   }
 
   private extendedGroup(members: readonly NodeReference[], added: ReadonlySet<NodeKey>): ProcessGroup | undefined {
@@ -254,12 +307,28 @@ export class ProcessState {
 
     const upserts: GroupSnapshot<ProcessGroupData>[] = []
     const removes: GroupKey[] = []
+    const appendedKeys = input.appendedKeys === undefined ? EMPTY_KEYS : input.appendedKeys
+    const byTurn = new Map<number, NodeKey[]>()
+    for (const key of appendedKeys) {
+      const turn = readPosition(input, key).turn
+      if (turn === undefined) continue
+      const keys = byTurn.get(turn)
+      if (keys === undefined) byTurn.set(turn, [key])
+      else keys.push(key)
+    }
     for (const turn of regroup) {
       const groups = this.turns.get(turn) ?? new TurnGroups(turn)
-      const update = groups.rebuild(input, added)
+      const keys = input.readTurn(turn)
+      const tailKeys = byTurn.get(turn)
+      const appended = tailKeys !== undefined && tailKeys.length > 0
+        ? groups.appendKeys(input, keys, tailKeys, added)
+        : undefined
+      const update = appended !== undefined
+        ? { upserts: appended, removes: [] as GroupKey[] }
+        : groups.rebuild(input, added)
       upserts.push(...update.upserts)
       removes.push(...update.removes)
-      if (input.readTurn(turn).length === 0) this.turns.delete(turn)
+      if (keys.length === 0) this.turns.delete(turn)
       else this.turns.set(turn, groups)
     }
     for (const [turn, keys] of changed) {

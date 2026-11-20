@@ -1253,6 +1253,7 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
     }
     this.store.upsert(upserts)
     let changedTurnOrders: readonly number[] = EMPTY_TURNS
+    let appendedKeys: readonly NodeKey[] | undefined
     if (structural) {
       const plan = movedExisting ? undefined : appendPlan(appendedCandidates, this.locations, this.orderMaxAnchor)
       if (plan === undefined) {
@@ -1267,6 +1268,7 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
         this.order = this.order.length === 0 ? plan.keys : [...this.order, ...plan.keys]
         this.orderMaxAnchor = plan.maxAnchor
         changedTurnOrders = this.locations.append(plan.entries)
+        appendedKeys = plan.keys as NodeKey[]
       }
     }
     this.locations.touch(contentOnly)
@@ -1288,6 +1290,8 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
       timeline: input.timeline,
       changedTurns: input.changedTurns ?? EMPTY_TURNS,
       changedTurnOrders,
+      // Only the pure tail append can vouch that existing keys kept their neighbours.
+      ...appendedKeys !== undefined ? { appendedKeys } : {},
     }
     const snapshot = this.snapshot(input.timeline, this.legacy.apply(upserts, input.timeline))
     return snapshot
@@ -1370,7 +1374,7 @@ function appendPlan(
     }
     // An input after this batch's control lifts the control to rank 1 ahead of
     // it, so the pair re-sorts within the Turn.
-    if (isAtOrOutside(node as Pick<ChatConversationViewNode, 'groupTree'>, 'input')
+    if (isAtOrOutside(node, 'input')
       && controlTurns.has(coordinates.turn ?? -1)) {
       return undefined
     }
