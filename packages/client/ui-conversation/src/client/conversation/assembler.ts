@@ -37,6 +37,8 @@ interface InternalContext {
   matches: ConversationMatch[]
   state: unknown
   revision: number
+  /** Matches already folded into State; location-agnostic replays skip while it equals matches.length. */
+  foldedMatches: number
   readonly current: Map<string, ConversationViewNode | null>
   readonly locationData: Record<ConversationLocationDataScope, ConversationLocationData | null>
   dependencies: Map<string, Dependency>
@@ -645,6 +647,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
       matches: [],
       state: undefined,
       revision: 0,
+      foldedMatches: 0,
       current: new Map(),
       locationData: emptyLocationData(),
       dependencies: new Map(),
@@ -690,6 +693,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
       const typed = contextSnapshot(context) as ConversationNodeContext & { readonly state: unknown }
       context.state = requireState(definition, 'update', definition.update(typed, match))
       context.revision++
+      context.foldedMatches = context.matches.length
       this.revised.add(context)
     }
     this.markDirty(context)
@@ -732,6 +736,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     for (const context of ordered) {
       if (context.start === undefined) {
         context.state = undefined
+        context.foldedMatches = 0
         this.replaceDependencies(context, new Map())
         context.revision++
         this.revised.add(context)
@@ -771,6 +776,11 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     if (context.matches[0] !== start) {
       throw new Error(`conversation Context ${context.key} received an update before its start Match`)
     }
+    // A location-agnostic State is a pure fold over Match events: keep it while
+    // every Match is already folded and only locations moved.
+    if (context.definition.locationAgnosticUpdate === true
+      && context.state !== undefined
+      && context.foldedMatches === context.matches.length) return
     const dependencies = new Map<string, Dependency>()
     const reader = this.readerFor(start.event.seq, dependencies)
     context.state = undefined
@@ -791,6 +801,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
       )
     }
     context.revision++
+    context.foldedMatches = context.matches.length
     this.revised.add(context)
     this.markDirty(context)
   }

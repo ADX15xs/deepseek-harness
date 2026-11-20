@@ -77,7 +77,7 @@ function makeAssembler(mount: boolean) {
 function run(maxSteps: number, mount: boolean) {
   const { assembler, read, mounted } = makeAssembler(mount)
   read()
-  const checkpoints = [25, 50, 100, 200, 300, 400, 500, 600].filter(c => c <= maxSteps)
+  const checkpoints = [25, 50, 100, 200, 300, 400, 500, 600, 900, 1200, 1500, 1800].filter(c => c <= maxSteps)
   const rows: { steps: number; nodes: number; perStepMs: number; cumMs: number }[] = []
   let seq = 10
   let cum = 0

@@ -243,6 +243,13 @@ export interface ConversationNodeDefinition<State = unknown> {
     match: ConversationMatch,
   ): State
   /**
+   * Declare that update() derives State from Match events alone, never from
+   * Match locations or other Contexts, and that start() reads no Context
+   * reader. The Engine then keeps such a Context's State across location
+   * rebuilds instead of replaying every Match.
+   */
+  readonly locationAgnosticUpdate?: boolean
+  /**
    * Select publication cadence for one accepted Match.
    * @param match - accepted Match.
    * @returns requested cadence; omission defaults to immediate.

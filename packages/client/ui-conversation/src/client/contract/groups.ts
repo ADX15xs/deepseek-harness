@@ -40,6 +40,12 @@ export interface GroupSnapshot<Data> {
 export interface GroupUpdate<Data> {
   /** Complete root sequence; only its Node references and referenced group members render. */
   readonly entries?: readonly RenderEntry[]
+  /**
+   * Root references appended after every entry of the previous root; only
+   * valid with the apply form. The store extends its root index in place
+   * instead of re-deriving references from the complete sequence.
+   */
+  readonly appendedEntries?: readonly RenderEntry[]
   readonly groups:
     | { readonly kind: 'replace'; readonly snapshots: readonly GroupSnapshot<Data>[] }
     | {

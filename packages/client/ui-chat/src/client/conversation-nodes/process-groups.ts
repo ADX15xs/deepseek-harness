@@ -254,6 +254,8 @@ export class ProcessState {
   private turns = new Map<number, TurnGroups>()
   private order: readonly NodeKey[] = []
   private pending: GroupUpdate<ProcessGroupData> | null = null
+  /** Entry references matching the current root order; valid until the order reorders or a Turn rebuilds. */
+  private entriesCache: readonly RenderEntry[] | undefined
 
   /**
    * Consume one synchronous Builder input without retaining its readers.
@@ -273,8 +275,9 @@ export class ProcessState {
       }
       this.turns = turns
       this.order = input.order
+      this.entriesCache = this.rootEntries(input)
       this.pending = {
-        entries: this.rootEntries(input),
+        entries: this.entriesCache,
         groups: { kind: 'replace', snapshots: [...turns.values()].flatMap(turn => turn.snapshots()) },
       }
       return
@@ -316,6 +319,7 @@ export class ProcessState {
       if (keys === undefined) byTurn.set(turn, [key])
       else keys.push(key)
     }
+    let rebuilt = false
     for (const turn of regroup) {
       const groups = this.turns.get(turn) ?? new TurnGroups(turn)
       const keys = input.readTurn(turn)
@@ -323,6 +327,7 @@ export class ProcessState {
       const appended = tailKeys !== undefined && tailKeys.length > 0
         ? groups.appendKeys(input, keys, tailKeys, added)
         : undefined
+      if (appended === undefined) rebuilt = true
       const update = appended !== undefined
         ? { upserts: appended, removes: [] as GroupKey[] }
         : groups.rebuild(input, added)
@@ -337,9 +342,27 @@ export class ProcessState {
     const reordered = input.order !== this.order || regroup.size > 0
     this.order = input.order
     const installed = new Set(upserts.map(group => group.key))
+    const refreshed = rebuilt || reordered
+    let entries: readonly RenderEntry[] | undefined
+    let appendedEntries: readonly RenderEntry[] | undefined
+    if (!refreshed && appendedKeys.length > 0 && this.entriesCache !== undefined) {
+      // Pure append: extend the cached root by each appended key's references.
+      appendedEntries = appendedKeys.flatMap((key): readonly RenderEntry[] => {
+        const turn = readPosition(input, key).turn
+        if (turn === undefined) return [{ kind: 'node', key }]
+        return this.turns.get(turn)?.references(key) ?? []
+      })
+      entries = [...this.entriesCache, ...appendedEntries]
+    } else if (refreshed || appendedKeys.length > 0) {
+      entries = this.rootEntries(input)
+    }
+    if (entries !== undefined) this.entriesCache = entries
     this.pending = reordered || upserts.length > 0 || removes.length > 0
       ? {
-        ...reordered ? { entries: this.rootEntries(input) } : {},
+        ...entries !== undefined
+          // The store only extends from a vouched pure append; other paths replace.
+          ? appendedEntries !== undefined ? { entries, appendedEntries } : { entries }
+          : {},
         groups: { kind: 'apply', upserts, removes: removes.filter(key => !installed.has(key)) },
       }
       : null

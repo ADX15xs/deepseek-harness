@@ -77,9 +77,12 @@ export class ConversationGroupStore<Data> implements ConversationGroupedView<Dat
     update: GroupUpdate<Data>,
     readNode: (key: NodeKey) => ConversationViewNode | undefined,
   ): void {
+    const appended = update.groups.kind === 'apply' ? update.appendedEntries : undefined
     const nextRoot = update.entries === undefined
       ? this.root
-      : reuseReferences(this.root, update.entries, sameEntry)
+      : appended !== undefined
+        ? [...this.root, ...appended]
+        : reuseReferences(this.root, update.entries, sameEntry)
     const nextRootGroups = nextRoot === this.root ? this.rootGroups : this.collectRootGroups(nextRoot)
     const { upserts, removes } = this.collectChanges(update)
     const replaceReferences = update.groups.kind === 'replace'
