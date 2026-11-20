@@ -1,7 +1,7 @@
 // An enclosing `[data-conversation-scroll]` owns scrolling when present;
 // otherwise this view owns it. Each row subscribes to one stable node key.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type {
   NodeKey, RenderEntry,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
@@ -20,6 +20,8 @@ import { ChatAside } from './ChatAside.tsx'
 import { mergeTurnRailItems } from './turn-rail-items.ts'
 import { useTextInteraction } from './text-interaction.ts'
 import { useChatScroll } from './use-chat-scroll.ts'
+import { chatRenderKey } from './render-entry.ts'
+import { sliceWindow, useMountWindow } from './use-mount-window.ts'
 import { fileMediaUrl, resolveWorkspacePath, sessionFileAddress } from '@deepseek-ai/dsh-util-workspace-path'
 import css from './ChatView.module.css'
 
@@ -83,6 +85,30 @@ export function ChatView({
   const groupedEntries = useConversation(snapshot => snapshot.views.grouped('chat')?.entries)
   const entries = useMemo<readonly RenderEntry[]>(() => groupedEntries
     ?? order.map(key => ({ kind: 'node', key: key as NodeKey })), [groupedEntries, order])
+  // Rows outside the mount window stay unmounted; the window keeps the tail
+  // mounted for live output and widens toward the head as the reader scrolls.
+  const { window: mountWindow, widenHead, ensureMounted, heights } = useMountWindow(entries.length)
+  const flow = useMemo(() => sliceWindow(entries, mountWindow, chatRenderKey), [entries, mountWindow])
+  const headSpacerHeight = useMemo(
+    () => mountWindow.start === 0 ? 0 : heights.total(flow.headKeys),
+    [mountWindow.start, heights, flow.headKeys],
+  )
+  const headSpacerRef = useRef<HTMLDivElement>(null)
+  const headSpacerHeightRef = useRef(headSpacerHeight)
+  headSpacerHeightRef.current = headSpacerHeight
+  const headSpacerRoomy = headSpacerHeight > 0
+  // Reaching the head spacer means the reader scrolled past the mounted head;
+  // widening moves rows into the window while the spacer hands their height back.
+  useEffect(() => {
+    if (!headSpacerRoomy) return
+    const sentinel = headSpacerRef.current
+    if (sentinel === null || typeof IntersectionObserver !== 'function') return
+    const observer = new IntersectionObserver((observed) => {
+      if (observed.some(entry => entry.isIntersecting)) widenHead()
+    }, { rootMargin: '25% 0%' })
+    observer.observe(sentinel)
+    return () => { observer.disconnect() }
+  }, [widenHead, headSpacerRoomy])
   const nodeStore = useChat(s => s.nodes)
   const deferCompletedTurns = usePresentation(policy => policy.collapseTiming === 'next-input')
   const transcriptView = usePresentation(policy => policy.mode)
@@ -228,6 +254,29 @@ export function ChatView({
   const interactionIds = useInteractionIds(ids => ids)
   const textInteraction = useTextInteraction(scroll.columnRef, interactionSurfaceRef, dispatchInteraction, interactionIds)
   const flowContext = useMemo<ChatFlowHookContext>(() => ({ motion: scroll.motion }), [scroll.motion])
+  // Record mounted row heights so unmounted head rows keep their scroll room
+  // estimated. Every row root carries data-chat-anchor-key, so matching those
+  // elements in order stays correct regardless of status blocks rendered ahead.
+  useLayoutEffect(() => {
+    const column = scroll.columnRef.current
+    if (column === null) return
+    const rows = Array.from(column.children).filter(
+      element => element instanceof HTMLElement && element.dataset.chatAnchorKey !== undefined,
+    )
+    for (let index = 0; index < flow.rows.length; index++) {
+      const element = rows[index] as HTMLElement | undefined
+      if (element !== undefined) heights.record(chatRenderKey(flow.rows[index] as RenderEntry), element.offsetHeight)
+    }
+  })
+  // Rail jumps to an earlier Turn must find that Turn's anchor mounted before
+  // the viewport can align to it; widen the window to its row first.
+  const navigateToTurn = useCallback((item: typeof railItems[number]) => {
+    if (item.anchor.kind === 'loaded') {
+      const index = order.indexOf(item.anchor.key)
+      if (index >= 0) ensureMounted(index)
+    }
+    scroll.navigateToTurn(item)
+  }, [order, ensureMounted, scroll.navigateToTurn])
 
   return (
     <div className={css.frame}>
@@ -236,7 +285,7 @@ export function ChatView({
           items={railItems}
           activeTurn={scroll.activeTurn}
           busyTurn={scroll.busyTurn}
-          onNavigate={scroll.navigateToTurn}
+          onNavigate={navigateToTurn}
           t={t}
         />
       )}
@@ -273,6 +322,10 @@ export function ChatView({
                 </button>
               </div>
             )}
+            {/* Unmounted head rows keep their measured height here; the reader
+                reaching this room widens the mount window upward. */}
+            <div ref={headSpacerRef} className={css.turnSpacer}
+              data-chat-head-spacer aria-hidden="true" style={{ height: headSpacerHeight }} />
             <MarkdownDelegateProvider
               getTriggerProps={getMarkdownTriggerProps}
               openFile={requestOpenFile}
@@ -281,7 +334,7 @@ export function ChatView({
               renderCode={renderCode}
             >
               {renderSlot('conversation.chat.flow', {
-                entries, pendingInputs, lastInputTurn, deferCollapse,
+                entries: flow.rows, pendingInputs, lastInputTurn, deferCollapse,
                 cwd, openFile: requestOpenFile, inspectCall, forkAt, loadImage,
               }, { hookContext: flowContext })}
             </MarkdownDelegateProvider>
