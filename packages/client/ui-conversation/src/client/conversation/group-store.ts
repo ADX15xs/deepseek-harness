@@ -130,7 +130,11 @@ export class ConversationGroupStore<Data> implements ConversationGroupedView<Dat
       parts.add(reference.groupPart)
     }
 
-    if (replaceReferences || nextRoot !== this.root) {
+    if (appended !== undefined && !replaceReferences) {
+      // Vouched pure append: existing root references stay valid; only the
+      // appended node entries need registering. Upserted members below are
+      // already part of the appended entries, so no extra accounting.
+    } else if (replaceReferences || nextRoot !== this.root) {
       for (const entry of this.root) if (entry.kind === 'node') removeReference(entry)
     }
     for (const key of removes) {
@@ -142,7 +146,9 @@ export class ConversationGroupStore<Data> implements ConversationGroupedView<Dat
         for (const member of previous.members) removeReference(member)
       }
     }
-    if (replaceReferences || nextRoot !== this.root) {
+    if (appended !== undefined && !replaceReferences) {
+      for (const entry of appended) if (entry.kind === 'node') addReference(entry)
+    } else if (replaceReferences || nextRoot !== this.root) {
       for (const entry of nextRoot) if (entry.kind === 'node') addReference(entry)
     }
     for (const [key, next] of upserts) {

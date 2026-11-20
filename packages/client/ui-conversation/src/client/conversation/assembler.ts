@@ -979,6 +979,22 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
       for (const context of this.contextsBySeq.get(seq) ?? []) affected.add(context)
     }
     for (const context of affected) {
+      if (context.definition.locationAgnosticUpdate === true) {
+        // Updates read only Match events, so retained Match locations stay valid; refresh the
+        // start Match alone because node builders read the start's Location directly. The
+        // refreshed reference must also replace the start inside the Matches array, or
+        // refreshStarts would find the stale Match and roll the start Location back.
+        const start = context.start
+        if (start !== undefined && changedSeqs.has(start.event.seq)) {
+          const refreshed: ConversationStartMatch = {
+            ...start,
+            location: this.locationIndex.locationOf(start.event),
+          }
+          context.start = refreshed
+          context.matches = context.matches.map((match): ConversationMatch => (match === start ? refreshed : match))
+        }
+        continue
+      }
       let start = context.start
       const matches = context.matches.map((match): ConversationMatch => {
         if (!changedSeqs.has(match.event.seq)) return match

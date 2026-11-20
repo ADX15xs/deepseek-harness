@@ -192,6 +192,8 @@ function sameLocation(left: ConversationLocation | undefined, right: Conversatio
 export class ConversationLocationIndex {
   private coordinates = new Map<number, Coordinates>()
   private seqsByTurn = new Map<number, Set<number>>()
+  private seqsByStep = new Map<string, Set<number>>()
+  private scopedSeqsByTurn = new Map<number, Set<number>>()
   private readonly stepsByTurn = new Map<number, Map<number, StepLocation>>()
   private timeline: ConversationTimelineSnapshot = { turnOrder: [], turns: new Map() }
   private readonly turnDataStores = new Map<number, MutableLocationDataStore>()
@@ -237,12 +239,8 @@ export class ConversationLocationIndex {
    * @param turn - Turn number.
    * @returns Session sequence numbers whose Location names only the Turn.
    */
-  turnScopedSeqs(turn: number): number[] {
-    const seqs: number[] = []
-    for (const seq of this.seqsByTurn.get(turn) ?? []) {
-      if (this.coordinates.get(seq)?.step === undefined) seqs.push(seq)
-    }
-    return seqs
+  turnScopedSeqs(turn: number): Iterable<number> {
+    return this.scopedSeqsByTurn.get(turn) ?? []
   }
 
   /**
@@ -450,9 +448,14 @@ export class ConversationLocationIndex {
     }
     this.coordinates = coordinates
     this.seqsByTurn = new Map()
+    this.seqsByStep = new Map()
+    this.scopedSeqsByTurn = new Map()
     for (const { event } of entries) {
       const coordinates = this.coordinates.get(event.seq) as Coordinates
       if (coordinates.turn !== undefined) this.indexTurnSeq(coordinates.turn, event.seq)
+      if (coordinates.turn !== undefined && coordinates.step !== undefined) {
+        this.indexStepSeq(coordinates.turn, coordinates.step, event.seq)
+      }
       coordinates.location = this.resolve(event.seq)
     }
     this.currentTurn = currentTurn
@@ -508,6 +511,7 @@ export class ConversationLocationIndex {
       location: this.coordinates.get(event.seq)?.location,
     })
     this.indexTurnSeq(turnNumber, event.seq)
+    if (stepNumber !== undefined) this.indexStepSeq(turnNumber, stepNumber, event.seq)
 
     const previousTurn = this.timeline.turns.get(turnNumber)
     let steps = previousTurn?.steps ?? EMPTY_STEPS
@@ -542,7 +546,7 @@ export class ConversationLocationIndex {
       || previousTurn.status !== status || previousTurn.data !== data
     const turn = turnReplaced
       ? { turn: turnNumber, start, end, status, steps, data } as TurnLocation
-      : previousTurn as TurnLocation
+      : previousTurn
     const stepsAdvanced = previousTurn !== undefined && previousTurn.steps !== steps
     if (stepsAdvanced) (turn as LiveTurnLocation).steps = steps
     if (turnReplaced) {
@@ -564,12 +568,15 @@ export class ConversationLocationIndex {
 
     const changed = new Set<number>()
     const ownedStep = event.type === 'step/start' || event.type === 'step/end' ? event.data.step : undefined
-    for (const seq of this.seqsByTurn.get(turnNumber) ?? []) {
+    // A Step boundary replaces only its own Step's StepLocation, so only that Step's
+    // indexed seqs can resolve differently. Turn boundaries rescan the whole Turn because
+    // TurnLocation identity may change for every seq; the Turn's live steps slot has
+    // already advanced in place above.
+    const scopedSeqs = ownedStep !== undefined
+      ? this.seqsByStep.get(stepDataKey(turnNumber, ownedStep)) ?? []
+      : this.seqsByTurn.get(turnNumber) ?? []
+    for (const seq of scopedSeqs) {
       const coordinates = this.coordinates.get(seq) as Coordinates
-      // A Step boundary replaces only its own Step's StepLocation, so seqs of other
-      // Steps keep theirs. The Turn keeps its identity unless start, end, or status
-      // changed, and its live steps slot already advanced in place above.
-      if (ownedStep !== undefined && coordinates.step !== ownedStep) continue
       const previous = coordinates.location
       const next = this.resolve(seq)
       coordinates.location = next
@@ -610,6 +617,7 @@ export class ConversationLocationIndex {
     }
     this.coordinates.set(event.seq, coordinates)
     if (turn !== undefined) this.indexTurnSeq(turn, event.seq)
+    if (turn !== undefined && step !== undefined) this.indexStepSeq(turn, step, event.seq)
     coordinates.location = this.resolve(event.seq)
   }
 
@@ -619,11 +627,22 @@ export class ConversationLocationIndex {
    */
   removeAssistantTransients(events: readonly AssistantLiveChunkEvent[]): void {
     for (const event of events) {
-      const turn = this.coordinates.get(event.seq)?.turn
+      const coordinates = this.coordinates.get(event.seq)
+      const turn = coordinates?.turn
       if (turn !== undefined) {
         const seqs = this.seqsByTurn.get(turn)
         seqs?.delete(event.seq)
         if (seqs?.size === 0) this.seqsByTurn.delete(turn)
+        const step = coordinates?.step
+        if (step !== undefined) {
+          const stepSeqs = this.seqsByStep.get(stepDataKey(turn, step))
+          stepSeqs?.delete(event.seq)
+          if (stepSeqs?.size === 0) this.seqsByStep.delete(stepDataKey(turn, step))
+        } else {
+          const scoped = this.scopedSeqsByTurn.get(turn)
+          scoped?.delete(event.seq)
+          if (scoped?.size === 0) this.scopedSeqsByTurn.delete(turn)
+        }
       }
       this.coordinates.delete(event.seq)
     }
@@ -643,6 +662,7 @@ export class ConversationLocationIndex {
     }
     this.coordinates.set(event.seq, coordinates)
     this.indexTurnSeq(event.data.turn, event.seq)
+    this.indexStepSeq(event.data.turn, event.data.step, event.seq)
     coordinates.location = this.resolve(event.seq)
   }
 
@@ -651,6 +671,24 @@ export class ConversationLocationIndex {
     if (current === undefined) {
       current = new Set<number>()
       this.seqsByTurn.set(turn, current)
+    }
+    current.add(seq)
+    if (this.coordinates.get(seq)?.step === undefined) {
+      let scoped = this.scopedSeqsByTurn.get(turn)
+      if (scoped === undefined) {
+        scoped = new Set<number>()
+        this.scopedSeqsByTurn.set(turn, scoped)
+      }
+      scoped.add(seq)
+    }
+  }
+
+  private indexStepSeq(turn: number, step: number, seq: number): void {
+    const key = stepDataKey(turn, step)
+    let current = this.seqsByStep.get(key)
+    if (current === undefined) {
+      current = new Set<number>()
+      this.seqsByStep.set(key, current)
     }
     current.add(seq)
   }

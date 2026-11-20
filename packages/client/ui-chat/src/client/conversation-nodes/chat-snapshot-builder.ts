@@ -446,13 +446,30 @@ class MutableTurnNavigationIndex implements ChatTurnNavigationIndex {
     if (!unchanged) this.current = next
   }
 
-  /** Re-derive only the Turns a content-only upsert touched. */
+  /**
+   * Re-derive only the touched Turns, appending items for Turns the index has never
+   * derived. Runs on structural appends whose existing rows keep their neighbours.
+   */
   touch(
     turns: ReadonlySet<number>,
+    turnOrder: readonly number[],
     locations: ChatLocationNodeIndex,
     nodes: ChatNodeStore,
   ): void {
     if (turns.size === 0) return
+    let missing = false
+    for (const turn of turns) {
+      if (!this.byTurn.has(turn)) {
+        missing = true
+        break
+      }
+    }
+    if (missing) {
+      // New Turns sit at ordered positions, so fall back to the ordered pass; item reuse
+      // keeps it cheap for Turns already derived.
+      this.rebuild({ turnOrder, turns: new Map() }, locations, nodes)
+      return
+    }
     const next = this.current.map((item) => {
       if (!turns.has(item.turn)) return item
       const derived = turnNavigationItem(item.turn, locations, nodes)
@@ -1274,10 +1291,16 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
     this.locations.touch(contentOnly)
     this.store.updateProcesses(processTurns, this.locations)
     this.store.settleBottom(input.timeline.turnOrder, this.locations)
-    if (structural || input.timeline !== this.timeline) {
+    const touchedTurns = new Set(turnsOf(contentOnly))
+    if (appendedKeys !== undefined) {
+      for (const turn of changedTurnOrders) touchedTurns.add(turn)
+      // The fast path keeps existing keys' neighbours, so deriving the appended Turns
+      // and appending new Turn items covers the whole structure change.
+      this.navigation.touch(touchedTurns, input.timeline.turnOrder, this.locations, this.store)
+    } else if (structural || input.timeline !== this.timeline) {
       this.navigation.rebuild(input.timeline, this.locations, this.store)
     } else {
-      this.navigation.touch(turnsOf(contentOnly), this.locations, this.store)
+      this.navigation.touch(touchedTurns, input.timeline.turnOrder, this.locations, this.store)
     }
     this.timeline = input.timeline
     this.latestGroupInput = {
