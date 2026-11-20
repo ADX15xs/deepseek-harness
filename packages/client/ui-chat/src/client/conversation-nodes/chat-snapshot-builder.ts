@@ -265,6 +265,7 @@ class MutableChatLocationIndex implements ChatLocationNodeIndex {
   private turns = new Map<number, readonly string[]>()
   private steps = new Map<string, readonly string[]>()
   private positions = new Map<string, GroupNodePosition>()
+  private orderTailKey: string | undefined
 
   getTurn(turn: number): readonly string[] {
     return this.turns.get(turn) ?? EMPTY_KEYS
@@ -316,6 +317,57 @@ class MutableChatLocationIndex implements ChatLocationNodeIndex {
     this.positions = positions
     this.turns = updateIndex(this.turns, turns)
     this.steps = updateIndex(this.steps, steps)
+    this.orderTailKey = order.findLast(key => store.get(key)?.location !== undefined)
+    return [...changedTurns]
+  }
+
+  /**
+   * Extend the index with nodes that append after the current tail.
+   * @param keys - appended keys in presentation order.
+   * @param positions - each appended key's owning turn.
+   * @param store - node store supplying locations.
+   * @returns the turns whose key arrays changed.
+   */
+  append(entries: readonly AppendEntry[]): readonly number[] {
+    const changedTurns = new Set<number>()
+    const turnKeys = new Map<number, string[]>()
+    const stepKeys = new Map<string, string[]>()
+    for (const [index, entry] of entries.entries()) {
+      this.positions.set(entry.key, {
+        turn: entry.turn,
+        previous: index === 0
+          ? this.orderTailKey as NodeKey | undefined
+          : entries[index - 1]?.key as NodeKey | undefined,
+        next: entries[index + 1]?.key as NodeKey | undefined,
+      })
+      if (entry.turn !== undefined) {
+        const keys = turnKeys.get(entry.turn) ?? [...(this.turns.get(entry.turn) ?? EMPTY_KEYS)]
+        keys.push(entry.key)
+        turnKeys.set(entry.turn, keys)
+      }
+      if (entry.turn !== undefined && entry.step !== undefined) {
+        const id = stepKey(entry.turn, entry.step)
+        const keys = stepKeys.get(id) ?? [...(this.steps.get(id) ?? EMPTY_KEYS)]
+        keys.push(entry.key)
+        stepKeys.set(id, keys)
+      }
+    }
+    for (const [turn, keys] of turnKeys) {
+      this.turns.set(turn, keys)
+      changedTurns.add(turn)
+    }
+    for (const [id, keys] of stepKeys) this.steps.set(id, keys)
+    const tail = this.orderTailKey === undefined ? undefined : this.positions.get(this.orderTailKey)
+    if (this.orderTailKey !== undefined && tail !== undefined) {
+      if (tail.turn !== undefined) changedTurns.add(tail.turn)
+      const position: GroupNodePosition = {
+        turn: tail.turn,
+        previous: tail.previous,
+        next: entries[0]?.key as NodeKey | undefined,
+      }
+      this.positions.set(this.orderTailKey, position)
+    }
+    this.orderTailKey = entries.at(-1)?.key
     return [...changedTurns]
   }
 
@@ -931,6 +983,7 @@ class LegacySliceBuilder {
   private readonly runningContributions = new Map<string, LegacyContribution>()
   private readonly partialContributions = new Map<string, LegacyContribution>()
   private finalized: readonly ConversationNode[] = EMPTY_LIST
+  private finalizedDirty = false
   private runningCalls: readonly RunningToolCall[] = EMPTY_LIST
   private partial: PartialAssistant | null = null
   private timeline: ConversationTimelineSnapshot | undefined
@@ -945,6 +998,7 @@ class LegacySliceBuilder {
     this.finalizedContributions.clear()
     this.runningContributions.clear()
     this.partialContributions.clear()
+    this.finalizedDirty = true
     for (const node of nodes) {
       const contribution = legacyContribution(node)
       this.contributions.set(node.key, contribution)
@@ -973,6 +1027,12 @@ class LegacySliceBuilder {
       partialChanged ||= partialContributionChanged(previous, contribution)
       this.contributions.set(node.key, contribution)
       this.indexContribution(node.key, contribution)
+      if (finalizedContributionChanged(previous, contribution)) {
+        // First-time finalized nodes carry monotonically increasing seqs and
+        // splice into the sorted stream; replacements and removals re-sort.
+        if ((previous?.nodes ?? EMPTY_LIST).length > 0) this.finalizedDirty = true
+        else if (contribution.nodes.length > 0) this.insertFinalized(contribution.nodes)
+      }
     }
     if (finalizedChanged) this.rebuildFinalized()
     if (runningChanged) this.rebuildRunning()
@@ -988,10 +1048,24 @@ class LegacySliceBuilder {
   }
 
   private rebuildFinalized(): void {
-    const finalized = [...this.finalizedContributions.values()]
-      .flatMap(value => value.nodes)
-      .sort((left, right) => left.seq - right.seq)
-    if (!sameReferences(this.finalized, finalized)) this.finalized = finalized
+    if (this.finalizedDirty) {
+      const finalized = [...this.finalizedContributions.values()]
+        .flatMap(value => value.nodes)
+        .sort((left, right) => left.seq - right.seq)
+      if (!sameReferences(this.finalized, finalized)) this.finalized = finalized
+      this.finalizedDirty = false
+    }
+  }
+
+  /** Insert newly finalized nodes at their sorted position; steady-state appends cost O(1) amortized. */
+  private insertFinalized(nodes: readonly ConversationNode[]): void {
+    const next = [...this.finalized]
+    let at = next.length
+    for (const node of nodes) {
+      while (at > 0 && (next[at - 1]?.seq ?? Number.NEGATIVE_INFINITY) > node.seq) at--
+      next.splice(at, 0, node)
+    }
+    this.finalized = next
   }
 
   private rebuildRunning(): void {
@@ -1093,6 +1167,12 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
   private readonly readGroupPosition = (key: NodeKey): GroupNodePosition | undefined => this.locations.getPosition(key)
   /** Last published timeline: a Turn boundary can land without a new node. */
   private timeline: ConversationTimelineSnapshot | null = null
+  /**
+   * Last anchor in `this.order`; the append fast path extends the order only
+   * while every new visible Node anchors after it, so one comparison replaces
+   * the full re-sort.
+   */
+  private orderMaxAnchor = Number.NEGATIVE_INFINITY
   readonly empty: ChatSnapshot
 
   constructor() {
@@ -1114,6 +1194,7 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
     const nodes = this.skillNames.replace(this.referenceLabels.replace(input.nodes))
     this.store.replace(nodes)
     this.order = orderedVisibleChatNodes(nodes).map(node => node.key)
+    this.orderMaxAnchor = maxAnchorOf(this.order, this.store)
     this.locations.rebuild(this.order, this.store)
     this.store.replaceProcesses(this.order, this.locations)
     this.store.settleBottom(input.timeline.turnOrder, this.locations)
@@ -1139,7 +1220,9 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
     const upserts = this.skillNames.apply(this.referenceLabels.apply(input.upserts, this.store), this.store)
     const processTurns = new Set<number>()
     let structural = false
+    let movedExisting = false
     const contentOnly: ChatConversationViewNode[] = []
+    const appendedCandidates: ChatConversationViewNode[] = []
     const changes: NodeChange<ChatConversationViewNode>[] = []
     for (const node of upserts) {
       const previous = this.store.get(node.key)
@@ -1151,6 +1234,15 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
         || previous.groupTree !== node.groupTree
         || locationIdentity(previous.location) !== locationIdentity(node.location)
       structural ||= nodeStructural
+      if (previous === undefined) appendedCandidates.push(node)
+      else if (nodeStructural && (isVisibleChatNode(previous as ChatNode) || isVisibleChatNode(node as ChatNode))) {
+        movedExisting = true
+      } else if (previous.kind === 'turn-process' && node.kind === 'turn-process'
+        && (previous as ChatNode<'turn-process'>).data.controlAnchorSeq
+          !== (node as ChatNode<'turn-process'>).data.controlAnchorSeq) {
+        // The control anchor decides which inputs lift ahead of the process block.
+        movedExisting = true
+      }
       if (!nodeStructural) contentOnly.push(node)
       if (processPresentationInputChanged(previous as ChatNode | undefined, node as ChatNode, nodeStructural)) {
         const previousTurn = previous === undefined ? undefined : locationCoordinates(previous.location).turn
@@ -1162,9 +1254,20 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
     this.store.upsert(upserts)
     let changedTurnOrders: readonly number[] = EMPTY_TURNS
     if (structural) {
-      const next = orderedVisibleChatNodes(this.store.values()).map(node => node.key)
-      this.order = sameReferences(this.order, next) ? this.order : next
-      changedTurnOrders = this.locations.rebuild(this.order, this.store)
+      const plan = movedExisting ? undefined : appendPlan(appendedCandidates, this.locations, this.orderMaxAnchor)
+      if (plan === undefined) {
+        const next = orderedVisibleChatNodes(this.store.values()).map(node => node.key)
+        this.order = sameReferences(this.order, next) ? this.order : next
+        this.orderMaxAnchor = maxAnchorOf(this.order, this.store)
+        changedTurnOrders = this.locations.rebuild(this.order, this.store)
+      } else if (plan.keys.length > 0) {
+        // Pure tail append: every new visible Node anchors after the current
+        // tail and moves no existing row, so the sorted order extends in place
+        // and the Location index gains one slot per key without a re-sort.
+        this.order = this.order.length === 0 ? plan.keys : [...this.order, ...plan.keys]
+        this.orderMaxAnchor = plan.maxAnchor
+        changedTurnOrders = this.locations.append(plan.entries)
+      }
     }
     this.locations.touch(contentOnly)
     this.store.updateProcesses(processTurns, this.locations)
@@ -1211,6 +1314,75 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
       legacy,
     }
   }
+}
+
+/** Highest anchorSeq among the given keys' nodes; empty keys yield -Infinity. */
+function maxAnchorOf(order: readonly string[], store: ChatNodeStore): number {
+  let max = Number.NEGATIVE_INFINITY
+  for (const key of order) {
+    const anchor = store.get(key)?.anchorSeq
+    if (anchor !== undefined && anchor > max) max = anchor
+  }
+  return max
+}
+
+interface AppendEntry {
+  readonly key: string
+  readonly turn: number | undefined
+  readonly step: number | undefined
+}
+
+interface AppendPlan {
+  readonly keys: readonly string[]
+  readonly entries: readonly AppendEntry[]
+  readonly maxAnchor: number
+}
+
+/**
+ * Whether the batch's first-appearance nodes can extend the current order as a
+ * pure tail append. Sorting lifts nodes below their Turn's opening-input anchor
+ * and places a fresh Turn-process control at its Turn block head, so those two
+ * shapes re-sort; every other first appearance anchors after the current tail
+ * and moves no existing row. The caller has already rejected batches that move
+ * an existing visible node.
+ * @param candidates - this batch's first-appearance nodes.
+ * @param locations - current Location index, consulted before the batch installs.
+ * @param orderMaxAnchor - anchor of the current order tail.
+ * @returns the append plan, or undefined to re-sort.
+ */
+function appendPlan(
+  candidates: readonly ChatConversationViewNode[],
+  locations: ChatLocationNodeIndex,
+  orderMaxAnchor: number,
+): AppendPlan | undefined {
+  const keys: string[] = []
+  const entries: AppendEntry[] = []
+  const touchedTurns = new Set<number>()
+  const controlTurns = new Set<number>()
+  let maxAnchor = Number.NEGATIVE_INFINITY
+  for (const node of candidates) {
+    if (!isVisibleChatNode(node as ChatNode)) continue
+    const coordinates = locationCoordinates(node.location)
+    if (node.anchorSeq <= Math.max(orderMaxAnchor, maxAnchor)) return undefined
+    if (node.kind === 'turn-process'
+      && (locations.getTurn(coordinates.turn ?? -1).length > 0 || touchedTurns.has(coordinates.turn ?? -1))) {
+      return undefined
+    }
+    // An input after this batch's control lifts the control to rank 1 ahead of
+    // it, so the pair re-sorts within the Turn.
+    if (isAtOrOutside(node as Pick<ChatConversationViewNode, 'groupTree'>, 'input')
+      && controlTurns.has(coordinates.turn ?? -1)) {
+      return undefined
+    }
+    keys.push(node.key)
+    entries.push({ key: node.key, turn: coordinates.turn, step: coordinates.step })
+    if (coordinates.turn !== undefined) {
+      touchedTurns.add(coordinates.turn)
+      if (node.kind === 'turn-process') controlTurns.add(coordinates.turn)
+    }
+    maxAnchor = node.anchorSeq
+  }
+  return { keys, entries, maxAnchor: Math.max(orderMaxAnchor, maxAnchor) }
 }
 
 /** Turns owning the given nodes, for the content-only navigation update. */
