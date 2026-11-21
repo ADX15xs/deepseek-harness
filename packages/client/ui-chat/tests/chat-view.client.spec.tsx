@@ -1986,6 +1986,58 @@ describe('ChatView', () => {
     }
   })
 
+  it('shifts the mount window with prepended rows instead of mounting the loaded page', () => {
+    const nodes = Array.from({ length: 120 }, (_, index) => user(20 + index, `row ${String(index)}`))
+    const h = makeHarness({ nodes })
+    const view = render(<h.ChatView {...h.props} />)
+    const rowKeys = () => [...view.container.querySelectorAll('[data-chat-flow-key]')]
+      .map(row => row.getAttribute('data-chat-flow-key'))
+    // The tail pin leaves the head rows unmounted behind the spacer.
+    expect(view.container.querySelector('[data-chat-head-spacer]')).not.toBeNull()
+    const before = rowKeys()
+    expect(before).toHaveLength(80)
+    expect(before[0]).toBe('fixture:user:60')
+
+    act(() => { h.setChat({ nodes: [user(10, 'older a'), user(12, 'older b'), ...nodes] }) })
+    // The same rows stay mounted and the page stays unmounted behind the spacer.
+    expect(rowKeys()).toEqual(before)
+    const spacer = view.container.querySelector('[data-chat-head-spacer]') as HTMLElement
+    expect(spacer.style.height).toBe('5880px')
+  })
+
+  it('mounts a grouped jump anchor before the viewport aligns to it', async () => {
+    const nodes = Array.from({ length: 45 }, (_, index) => {
+      const turn = index + 1
+      return [userInTurn(turn * 3 - 2, `prompt ${turn}`, turn),
+        reasoningAssistant(turn * 3 - 1, `analysis ${turn}`, turn), assistant(turn * 3, `answer ${turn}`, turn)]
+    }).flat()
+    const source = chatSnapshotFixture({ nodes })
+    const builder = new ChatSnapshotBuilder()
+    const state = new ProcessState()
+    const groups = new ConversationGroupStore<ProcessGroupData>()
+    const h = makeHarness({ chat: installGroupedSnapshot(builder, state, groups, source) })
+    h.setGrouped(groups)
+    const view = render(<h.ChatView {...h.props} />)
+    // The rail centers on the latest turn once its size lands; scroll it after
+    // that placement to reveal the first button.
+    const nav = view.getByRole('navigation', { name: '轮次导航' })
+    const railScroller = nav.querySelector('[class*="scroller"]') as HTMLElement
+    await view.findByRole('button', { name: '跳转到第 45 轮' })
+    railScroller.scrollTop = 0
+    fireEvent.scroll(railScroller)
+    const first = await view.findByRole('button', { name: '跳转到第 1 轮' })
+    // The tail-pinned window leaves the first Turn unmounted.
+    expect(view.container.querySelector('[data-chat-node-key="fixture:user:1"]')).toBeNull()
+
+    const scroller = view.container.querySelector('[data-chat-flow]')!.parentElement as HTMLDivElement
+    installScrollMetrics(scroller, 2_000, 600)
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue({ top: 0, bottom: 600 } as DOMRect)
+    fireEvent.click(first)
+    // The widened commit mounted the anchor and the deferred navigation landed.
+    expect(view.container.querySelector('[data-chat-node-key="fixture:user:1"]')).not.toBeNull()
+    expect(first.getAttribute('aria-current')).toBe('true')
+  })
+
   it('renders the fixture main line as independently keyed business nodes', () => {
     const h = makeHarness({
       nodes: [user(1, 'do the thing'), assistant(2, 'running tools'), toolResult(3, 'a'), toolResult(4, 'b')],

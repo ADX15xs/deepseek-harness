@@ -85,9 +85,21 @@ export function ChatView({
   const groupedEntries = useConversation(snapshot => snapshot.views.grouped('chat')?.entries)
   const entries = useMemo<readonly RenderEntry[]>(() => groupedEntries
     ?? order.map(key => ({ kind: 'node', key: key as NodeKey })), [groupedEntries, order])
+  // History paging prepends rows above the previous head; shifting the window
+  // by their count keeps the mounted row set unchanged instead of mounting
+  // every loaded page. A replaced head the shift cannot find keeps the window.
+  const headKey = entries.length === 0 ? null : chatRenderKey(entries[0] as RenderEntry)
+  const headKeyRef = useRef<string | null>(null)
+  let prependShift = 0
+  const previousHeadKey = headKeyRef.current
+  if (previousHeadKey !== null && headKey !== null && headKey !== previousHeadKey) {
+    const shift = entries.findIndex(entry => chatRenderKey(entry) === previousHeadKey)
+    if (shift > 0) prependShift = shift
+  }
+  headKeyRef.current = headKey
   // Rows outside the mount window stay unmounted; the window keeps the tail
   // mounted for live output and widens toward the head as the reader scrolls.
-  const { window: mountWindow, widenHead, ensureMounted, heights } = useMountWindow(entries.length)
+  const { window: mountWindow, widenHead, ensureMounted, heights } = useMountWindow(entries.length, prependShift)
   const flow = useMemo(() => sliceWindow(entries, mountWindow, chatRenderKey), [entries, mountWindow])
   const headSpacerHeight = useMemo(
     () => mountWindow.start === 0 ? 0 : heights.total(flow.headKeys),
@@ -269,14 +281,33 @@ export function ChatView({
     }
   })
   // Rail jumps to an earlier Turn must find that Turn's anchor mounted before
-  // the viewport can align to it; widen the window to its row first.
+  // the viewport can align to it. The anchor resolves against the grouped
+  // entries, whose node references carry the same keys in grouped and flat
+  // modes; when the row sits outside the mount window, widen first and issue
+  // the navigation from the widened commit.
+  const pendingAnchorRef = useRef<typeof railItems[number] | null>(null)
   const navigateToTurn = useCallback((item: typeof railItems[number]) => {
     if (item.anchor.kind === 'loaded') {
-      const index = order.indexOf(item.anchor.key)
-      if (index >= 0) ensureMounted(index)
+      const anchorKey = item.anchor.key
+      const index = entries.findIndex(entry => entry.kind === 'node' && entry.key === anchorKey)
+      if (index >= 0 && (index < mountWindow.start || index >= mountWindow.end)) {
+        pendingAnchorRef.current = item
+        ensureMounted(index)
+        return
+      }
     }
+    pendingAnchorRef.current = null
     scroll.navigateToTurn(item)
-  }, [order, ensureMounted, scroll.navigateToTurn])
+  }, [entries, mountWindow, ensureMounted, scroll.navigateToTurn])
+  useLayoutEffect(() => {
+    const pending = pendingAnchorRef.current
+    if (pending === null || pending.anchor.kind !== 'loaded') return
+    const anchorKey = pending.anchor.key
+    const index = entries.findIndex(entry => entry.kind === 'node' && entry.key === anchorKey)
+    if (index < 0 || index < mountWindow.start || index >= mountWindow.end) return
+    pendingAnchorRef.current = null
+    scroll.navigateToTurn(pending)
+  })
 
   return (
     <div className={css.frame}>

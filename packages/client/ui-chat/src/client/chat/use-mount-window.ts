@@ -43,12 +43,14 @@ export class RowHeightCache {
 
 /**
  * Index window over the ordered rows. The window pins to the tail while rows
- * append; the reader reaching the head spacer widens it upward, and explicit
- * navigation requests widen it to the target row before that row mounts.
+ * append; the reader reaching the head spacer widens it upward, explicit
+ * navigation requests widen it to the target row before that row mounts, and
+ * rows prepended above the head shift the window so the mounted rows stay.
  * @param total - current full entry count.
+ * @param prependShift - rows prepended above the previous head this render.
  * @returns the window range, the widening callbacks, and the height cache.
  */
-export function useMountWindow(total: number): {
+export function useMountWindow(total: number, prependShift = 0): {
   readonly window: MountWindow
   /** Widen the window upward when the reader reaches the head spacer. */
   readonly widenHead: () => void
@@ -62,16 +64,20 @@ export function useMountWindow(total: number): {
     end: total,
   }))
   // Render-time reconciliation keeps the slice valid when rows append, without
-  // an effect round trip; the head only ever moves toward zero.
+  // an effect round trip; the head moves toward zero as the reader widens and
+  // shifts down-list with rows prepended above it.
   const totalRef = useRef(total)
   if (totalRef.current !== total) {
     totalRef.current = total
-    if (window.end < total || window.start > total - MOUNT_MINIMUM) {
-      setWindow({
-        start: Math.max(0, Math.min(window.start, total - MOUNT_MINIMUM)),
-        end: Math.max(window.end, total),
-      })
+    let next = window
+    if (prependShift > 0) next = { start: next.start + prependShift, end: next.end + prependShift }
+    if (next.end < total || next.start > total - MOUNT_MINIMUM) {
+      next = {
+        start: Math.max(0, Math.min(next.start, total - MOUNT_MINIMUM)),
+        end: Math.max(next.end, total),
+      }
     }
+    if (next !== window) setWindow(next)
   }
   const heights = useMemo(() => new RowHeightCache(), [])
   const widenHead = useCallback(() => {
