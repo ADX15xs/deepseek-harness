@@ -28,12 +28,20 @@ const ROW_HEIGHT_DEFAULT = 140
 export class RowHeightCache {
   private readonly heights = new Map<string, number>()
 
-  /** @param key - stable render key. @param height - measured outer height in pixels. */
+  /**
+    * Records a measured row height for later spacer estimates.
+    * @param key - stable render key.
+    * @param height - measured outer height in pixels.
+    */
   record(key: string, height: number): void {
     if (height > 0) this.heights.set(key, height)
   }
 
-  /** @param keys - stable render keys in order. @returns the summed estimated height in pixels. */
+  /**
+    * Sums the estimated heights of the given ordered rows.
+    * @param keys - stable render keys in order.
+    * @returns the summed estimated height in pixels.
+    */
   total(keys: readonly string[]): number {
     let sum = 0
     for (const key of keys) sum += this.heights.get(key) ?? ROW_HEIGHT_DEFAULT
